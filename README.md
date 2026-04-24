@@ -6,12 +6,13 @@ A toolkit for visualizing and measuring how ideas cluster, drift, and evolve in 
 
 Semantic Telemetry turns free-form ideas (text) into points in a high-dimensional semantic space using sentence embeddings (SBERT), then uses **t-SNE** to project them into 2D for visualization and a small library of **centroid-based metrics** to quantify originality, divergence, and semantic drift.
 
-The project provides four pipelines that operate on a CSV of ideas:
+The project provides five pipelines that operate on a CSV of ideas:
 
-1. **Full t-SNE Visual** — embeds every idea and plots the complete semantic map.
-2. **Group Telemetry** — splits a session into two time phases (0–5 min, 5–10 min) and reports how the group's ideas moved, spread, and introduced novelty between phases.
-3. **Individual Telemetry** — plots each participant's trajectory on the shared global semantic map so you can see *where* a person's ideas moved, not just how far.
+1. **Full t-SNE Visual** — embeds every idea and plots the complete semantic map. When timestamps are present, points are colored by time of appearance (viridis: dark = early, bright = late) with a colorbar, so temporal structure is visible on the map itself.
+2. **Group Telemetry** — splits a session into **N configurable time windows** (equal-duration by default, or fixed-size via `window_minutes`) and reports per-window dispersion, consecutive-window centroid shift and novelty, and an overall first-to-last summary. The scatter plot shows all windows on one t-SNE with a dashed line connecting window centroids in order.
+3. **Individual Telemetry** — plots each participant's trajectory across N windows on the shared global semantic map, colored by phase, with a dashed trajectory line through each of the participant's phase centroids.
 4. **Single-Idea Originality Score** — scores one candidate idea against a reference dataset and returns its originality percentile relative to the rest of the corpus.
+5. **Cross-Session Comparison** — projects ideas from multiple CSVs onto a single shared t-SNE map, reports per-session dispersion and pairwise centroid shift and novelty, and draws a trajectory between session centroids so you can see whether repeated sessions are converging or exploring new territory.
 
 ### Metrics
 
@@ -56,7 +57,7 @@ The tool expects a CSV with the following columns:
 | `idea`           | yes                          | The raw text of the idea.                          |
 | `participant_id` | only for individual pipeline | Identifier for who contributed the idea.           |
 
-The group and individual pipelines split the session into **Time 1 (first 5 minutes)** and **Time 2 (remaining minutes)** based on the earliest timestamp.
+The group and individual pipelines split the session into N time windows. By default, `n_windows=2` produces equal-duration halves based on the session's earliest and latest timestamps. Pass `n_windows=4` (or any integer) for finer time slicing, or `window_minutes=M` to use fixed-size windows instead (the number of windows is derived from the session's total duration).
 
 ## Usage
 
@@ -65,10 +66,16 @@ Edit the execution block at the bottom of `semantic_telemetry.py` and uncomment 
 ```python
 csv_file = 'ideaData.csv'
 
-run_full_tsne_visual(csv_file)
-# run_group_telemetry(csv_file)
-# run_individual_telemetry(csv_file)
+run_full_tsne_visual(csv_file)                          # colored by timestamp if available
+# run_full_tsne_visual(csv_file, color_by_time=False)   # uniform color
+# run_group_telemetry(csv_file, n_windows=4)            # 4 equal-duration windows
+# run_group_telemetry(csv_file, window_minutes=2)       # fixed 2-minute windows
+# run_individual_telemetry(csv_file, n_windows=3)
 # score_idea_originality("Making bundles all inclusive", csv_file)
+# run_cross_session_comparison(
+#     ['sessionA.csv', 'sessionB.csv'],
+#     session_names=['Monday brainstorm', 'Friday brainstorm'],
+# )
 ```
 
 Then run:
@@ -79,10 +86,11 @@ python semantic_telemetry.py
 
 ### Pipeline reference
 
-- `run_full_tsne_visual(csv_filepath)` — scatter plot of every idea in 2D t-SNE space, with short labels.
-- `run_group_telemetry(csv_filepath)` — prints centroid shift, dispersion (T1 and T2), net expansion, and average novelty; plots T1 (red) vs. T2 (green).
-- `run_individual_telemetry(csv_filepath)` — per-participant subplot showing each person's T1→T2 movement against the global semantic map, with a dashed trajectory line between centroids.
+- `run_full_tsne_visual(csv_filepath, color_by_time=True)` — scatter of every idea in 2D t-SNE space with short labels. Points are colored by timestamp when available.
+- `run_group_telemetry(csv_filepath, n_windows=2, window_minutes=None)` — prints per-window dispersion, consecutive-window centroid shift and novelty, and an overall summary when N > 2; plots all windows with a centroid trajectory.
+- `run_individual_telemetry(csv_filepath, n_windows=2, window_minutes=None)` — per-participant subplot showing each person's path through N phases on the global semantic map.
 - `score_idea_originality(idea, csv_filepath)` — returns the idea's centroid distance and its originality percentile against the reference corpus.
+- `run_cross_session_comparison(csv_filepaths, session_names=None)` — projects two or more session CSVs onto a shared t-SNE, prints per-session dispersion and pairwise shift/novelty, and draws a trajectory between session centroids.
 
 ## Implications and Future Work
 

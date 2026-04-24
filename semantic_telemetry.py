@@ -55,11 +55,16 @@ def get_novelty(emb_t2, emb_t1):
     min_dist_to_past = 1.0 - np.max(cross_sim, axis=1)
     return np.mean(min_dist_to_past)
 
-def ingest_and_split(csv_filepath, requires_participants=False):
-    """Standardized data intake manifold."""
+def ingest_and_split(csv_filepath, requires_participants=False, n_windows=2, window_minutes=None):
+    """
+    Standardized data intake. Splits ideas into time windows.
+
+    n_windows: number of equal-duration windows to split the session into.
+    window_minutes: if set, use fixed-size windows of this many minutes instead
+                    (n_windows is then derived from session length).
+    """
     df = pd.read_csv(csv_filepath)
 
-    # Check for required columns
     required_cols = ['timeStamp', 'idea']
     if requires_participants:
         required_cols.append('participant_id')
@@ -70,25 +75,54 @@ def ingest_and_split(csv_filepath, requires_participants=False):
 
     df = df.dropna(subset=required_cols)
     df['timeStamp'] = pd.to_datetime(df['timeStamp'])
-    df = df.sort_values(by='timeStamp')
+    df = df.sort_values(by='timeStamp').reset_index(drop=True)
 
     start_time = df['timeStamp'].min()
-    midpoint = start_time + pd.Timedelta(minutes=5)
-    df['Time_Phase'] = np.where(df['timeStamp'] < midpoint, 'Time 1', 'Time 2')
+    end_time = df['timeStamp'].max()
+    total_seconds = max((end_time - start_time).total_seconds(), 1e-6)
+
+    if window_minutes is not None:
+        n_windows = max(1, math.ceil(total_seconds / 60.0 / window_minutes))
+        edge_seconds = [min(i * window_minutes * 60.0, total_seconds) for i in range(n_windows + 1)]
+    else:
+        edge_seconds = [total_seconds * i / n_windows for i in range(n_windows + 1)]
+
+    # Nudge the final edge so the max timestamp is included in the last bin.
+    edge_seconds[-1] = total_seconds + 1e-6
+
+    labels = [f'Time {i + 1}' for i in range(n_windows)]
+    ts_seconds = (df['timeStamp'] - start_time).dt.total_seconds()
+    df['Time_Phase'] = pd.cut(ts_seconds, bins=edge_seconds, labels=labels, include_lowest=True).astype(str)
 
     return df
+
+
+def _ordered_phases(df):
+    """Return the phase labels present in df, ordered by their numeric suffix."""
+    return sorted(df['Time_Phase'].dropna().unique(), key=lambda x: int(x.split()[-1]))
 
 # ==========================================
 # 3. FULL T-SNE VISUAL PIPELINE
 # ==========================================
-def run_full_tsne_visual(csv_filepath):
+def run_full_tsne_visual(csv_filepath, color_by_time=True):
+    """
+    Full t-SNE map of all ideas. When the CSV has a 'timeStamp' column and
+    color_by_time=True, points are colored by time of appearance (viridis:
+    dark = early, bright = late).
+    """
     print(f"\n=== RUNNING FULL t-SNE VISUAL: {csv_filepath} ===")
     df = pd.read_csv(csv_filepath)
 
     if 'idea' not in df.columns:
         raise ValueError("CSV is missing required column: 'idea'")
 
-    df = df.dropna(subset=['idea'])
+    df = df.dropna(subset=['idea']).reset_index(drop=True)
+
+    has_time = color_by_time and 'timeStamp' in df.columns
+    if has_time:
+        df['timeStamp'] = pd.to_datetime(df['timeStamp'], errors='coerce')
+        df = df.dropna(subset=['timeStamp']).sort_values(by='timeStamp').reset_index(drop=True)
+
     all_ideas = df['idea'].tolist()
 
     if len(all_ideas) < 2:
@@ -102,7 +136,15 @@ def run_full_tsne_visual(csv_filepath):
     tsne_2d = TSNE(n_components=2, perplexity=perp, random_state=42).fit_transform(embeddings)
 
     plt.figure(figsize=(12, 9))
-    plt.scatter(tsne_2d[:, 0], tsne_2d[:, 1], s=150, c='steelblue', alpha=0.7)
+
+    if has_time:
+        ts_seconds = (df['timeStamp'] - df['timeStamp'].min()).dt.total_seconds().values
+        scatter = plt.scatter(tsne_2d[:, 0], tsne_2d[:, 1], s=150, c=ts_seconds,
+                              cmap='viridis', alpha=0.8)
+        cbar = plt.colorbar(scatter)
+        cbar.set_label('Seconds from session start')
+    else:
+        plt.scatter(tsne_2d[:, 0], tsne_2d[:, 1], s=150, c='steelblue', alpha=0.7)
 
     for i, idea in enumerate(all_ideas):
         short_label = " ".join(idea.split()[:3]) + "..."
@@ -123,67 +165,105 @@ def run_full_tsne_visual(csv_filepath):
 # ==========================================
 # 4. GROUP-LEVEL PIPELINE
 # ==========================================
-def run_group_telemetry(csv_filepath):
+def run_group_telemetry(csv_filepath, n_windows=2, window_minutes=None):
+    """
+    Group-level pipeline across N time windows.
+
+    Reports per-window dispersion, consecutive-window centroid shift and
+    novelty, and an overall first-to-last summary. Plots all windows on a
+    shared t-SNE with viridis colors and a centroid trajectory.
+    """
     print(f"\n=== RUNNING GROUP PIPELINE: {csv_filepath} ===")
-    df = ingest_and_split(csv_filepath, requires_participants=False)
+    df = ingest_and_split(csv_filepath, requires_participants=False,
+                          n_windows=n_windows, window_minutes=window_minutes)
 
-    t1_df = df[df['Time_Phase'] == 'Time 1']
-    t2_df = df[df['Time_Phase'] == 'Time 2']
+    phases = _ordered_phases(df)
+    phase_data = []
+    for phase in phases:
+        ideas = df[df['Time_Phase'] == phase]['idea'].tolist()
+        if len(ideas) == 0:
+            print(f"{phase}: 0 ideas (skipped)")
+            continue
+        emb = model.encode(ideas)
+        phase_data.append({'phase': phase, 'ideas': ideas, 'emb': emb})
 
-    ideas_t1, ideas_t2 = t1_df['idea'].tolist(), t2_df['idea'].tolist()
-
-    print(f"Time 1 Ideas (0-5 mins): {len(ideas_t1)}")
-    print(f"Time 2 Ideas (5-10 mins): {len(ideas_t2)}")
-
-    if len(ideas_t1) < 2 or len(ideas_t2) < 2:
-        print("\nERROR: Not enough ideas to run math.")
+    if len(phase_data) < 2:
+        print("\nERROR: Need ideas in at least 2 non-empty time windows.")
         return
-    print("Encoding ideas into semantic space...")
-    emb_t1 = model.encode(ideas_t1)
-    emb_t2 = model.encode(ideas_t2)
-
-    # --- Metrics ---
-    shift = get_centroid_shift(emb_t1, emb_t2)
-    disp1, disp2 = get_dispersion(emb_t1), get_dispersion(emb_t2)
-    novelty = get_novelty(emb_t2, emb_t1)
 
     print("\n--- GROUP TELEMETRY REPORT ---")
-    print(f"1. Centroid Shift (Semantic Drift): {shift:.4f}")
-    print(f"2. Dispersion Time 1: {disp1:.4f}")
-    print(f"   Dispersion Time 2: {disp2:.4f}")
-    print(f"   Net Expansion: {disp2 - disp1:+.4f}")
-    print(f"3. Avg Novelty of Time 2 Ideas: {novelty:.4f}")
-    # --- Plotting ---
-    all_ideas = ideas_t1 + ideas_t2
-    all_embeddings = np.vstack((emb_t1, emb_t2))
-    colors = ['red'] * len(ideas_t1) + ['green'] * len(ideas_t2)
+    print("Per-window:")
+    for d in phase_data:
+        disp = get_dispersion(d['emb']) if len(d['emb']) >= 2 else float('nan')
+        disp_str = f"{disp:.4f}" if not math.isnan(disp) else "n/a"
+        print(f"  {d['phase']}: {len(d['ideas'])} ideas | Dispersion: {disp_str}")
 
-    perp = min(5, len(all_ideas) - 1)
+    print("\nConsecutive transitions:")
+    for i in range(1, len(phase_data)):
+        prev, curr = phase_data[i - 1], phase_data[i]
+        shift = get_centroid_shift(prev['emb'], curr['emb'])
+        novelty = get_novelty(curr['emb'], prev['emb'])
+        print(f"  {prev['phase']} -> {curr['phase']}: Shift={shift:.4f} | Novelty={novelty:.4f}")
+
+    if len(phase_data) > 2:
+        first, last = phase_data[0], phase_data[-1]
+        all_prior = np.vstack([d['emb'] for d in phase_data[:-1]])
+        print("\nOverall:")
+        print(f"  {first['phase']} -> {last['phase']}: Shift={get_centroid_shift(first['emb'], last['emb']):.4f}")
+        print(f"  Novelty of {last['phase']} vs all prior: {get_novelty(last['emb'], all_prior):.4f}")
+
+    # --- Plotting ---
+    all_ideas = [idea for d in phase_data for idea in d['ideas']]
+    all_embeddings = np.vstack([d['emb'] for d in phase_data])
+
+    cmap = plt.get_cmap('viridis', len(phase_data))
+    phase_colors = [cmap(i) for i in range(len(phase_data))]
+    point_colors = []
+    for i, d in enumerate(phase_data):
+        point_colors.extend([phase_colors[i]] * len(d['ideas']))
+
+    perp = min(max(5, len(all_ideas) // 4), len(all_ideas) - 1)
     tsne_2d = TSNE(n_components=2, perplexity=perp, random_state=42).fit_transform(all_embeddings)
 
     plt.figure(figsize=(10, 8))
-    plt.scatter(tsne_2d[:, 0], tsne_2d[:, 1], s=150, c=colors, alpha=0.7)
+    plt.scatter(tsne_2d[:, 0], tsne_2d[:, 1], s=150, c=point_colors, alpha=0.7)
 
     for i, idea in enumerate(all_ideas):
         short_label = " ".join(idea.split()[:3]) + "..."
-        plt.annotate(short_label, (tsne_2d[i, 0], tsne_2d[i, 1]), xytext=(5, 5), textcoords='offset points')
+        plt.annotate(short_label, (tsne_2d[i, 0], tsne_2d[i, 1]),
+                     xytext=(5, 5), textcoords='offset points', fontsize=8)
 
-    plt.title("Group Semantic Evolution: Time 1 (Red) vs. Time 2 (Green)", fontweight='bold')
+    # Centroid trajectory through the 2D projection, in phase order.
+    offsets = np.cumsum([0] + [len(d['ideas']) for d in phase_data])
+    cx = [tsne_2d[offsets[i]:offsets[i + 1], 0].mean() for i in range(len(phase_data))]
+    cy = [tsne_2d[offsets[i]:offsets[i + 1], 1].mean() for i in range(len(phase_data))]
+    plt.plot(cx, cy, color='black', linestyle='--', linewidth=2, alpha=0.6, label='Centroid trajectory')
+    plt.scatter(cx, cy, s=250, c=phase_colors, marker='X', edgecolor='black', linewidth=1.5, zorder=5)
+
+    plt.title(f"Group Semantic Evolution: {len(phase_data)} Time Windows", fontweight='bold')
     plt.gca().set_aspect('equal', adjustable='datalim')
     plt.margins(0.2)
     plt.grid(True, linestyle='--', alpha=0.5)
 
-    legend_elements = [Line2D([0], [0], marker='o', color='w', label='Time 1', markerfacecolor='red', markersize=10),
-                       Line2D([0], [0], marker='o', color='w', label='Time 2', markerfacecolor='green', markersize=10)]
+    legend_elements = [Line2D([0], [0], marker='o', color='w', label=d['phase'],
+                              markerfacecolor=phase_colors[i], markersize=10)
+                       for i, d in enumerate(phase_data)]
+    legend_elements.append(Line2D([0], [0], color='black', linestyle='--', label='Centroid trajectory'))
     plt.legend(handles=legend_elements, loc='best')
     plt.show()
 
 # ==========================================
 # 5. INDIVIDUAL-LEVEL PIPELINE
 # ==========================================
-def run_individual_telemetry(csv_filepath):
+def run_individual_telemetry(csv_filepath, n_windows=2, window_minutes=None):
+    """
+    Per-participant trajectories across N time windows, plotted on the shared
+    global t-SNE map. Each participant's subplot colors their ideas by phase
+    and draws a dashed line connecting the centroid of each non-empty phase.
+    """
     print(f"\n=== RUNNING INDIVIDUAL PIPELINE: {csv_filepath} ===")
-    df = ingest_and_split(csv_filepath, requires_participants=True)
+    df = ingest_and_split(csv_filepath, requires_participants=True,
+                          n_windows=n_windows, window_minutes=window_minutes)
 
     print("Encoding all ideas to build the Global Semantic Map...")
     all_ideas = df['idea'].tolist()
@@ -196,48 +276,70 @@ def run_individual_telemetry(csv_filepath):
     df['tSNE_Y'] = global_tsne_coords[:, 1]
     df['embedding'] = list(all_embeddings)
 
+    phases = _ordered_phases(df)
+    cmap = plt.get_cmap('viridis', len(phases))
+    phase_colors = {phase: cmap(i) for i, phase in enumerate(phases)}
+
     participants = df['participant_id'].unique()
     cols = 2
     rows = math.ceil(len(participants) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(15, 6 * rows))
-    if len(participants) == 1: axes = [axes] # Handle single participant edge case
-    else: axes = axes.flatten()
+    if len(participants) == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
 
     for idx, p_id in enumerate(participants):
         p_df = df[df['participant_id'] == p_id]
-        t1_df = p_df[p_df['Time_Phase'] == 'Time 1']
-        t2_df = p_df[p_df['Time_Phase'] == 'Time 2']
-
         print(f"\n--- Participant: {p_id} ---")
-        print(f"Ideas: {len(t1_df)} (T1) | {len(t2_df)} (T2)")
 
-        if len(t1_df) > 0 and len(t2_df) > 0:
-            emb_t1 = np.vstack(t1_df['embedding'].values)
-            emb_t2 = np.vstack(t2_df['embedding'].values)
+        phase_embs = {}
+        for phase in phases:
+            sub = p_df[p_df['Time_Phase'] == phase]
+            if len(sub) > 0:
+                phase_embs[phase] = np.vstack(sub['embedding'].values)
 
-            print(f"Centroid Shift: {get_centroid_shift(emb_t1, emb_t2):.4f}")
-            if len(emb_t1) > 1 and len(emb_t2) > 1:
-                print(f"Dispersion Change: {get_dispersion(emb_t2) - get_dispersion(emb_t1):+.4f}")
-        else:
-            print("Metrics: Needs ideas in BOTH time periods to calculate shift.")
+        counts = " | ".join(f"{phase}: {len(phase_embs.get(phase, []))}" for phase in phases)
+        print(f"Ideas: {counts}")
+
+        present_phases = [phase for phase in phases if phase in phase_embs]
+        for i in range(1, len(present_phases)):
+            prev, curr = present_phases[i - 1], present_phases[i]
+            shift = get_centroid_shift(phase_embs[prev], phase_embs[curr])
+            line = f"  {prev} -> {curr}: Shift={shift:.4f}"
+            if len(phase_embs[prev]) > 1 and len(phase_embs[curr]) > 1:
+                disp_delta = get_dispersion(phase_embs[curr]) - get_dispersion(phase_embs[prev])
+                line += f" | Dispersion change: {disp_delta:+.4f}"
+            print(line)
+        if len(present_phases) < 2:
+            print("  (Needs ideas in >=2 time windows to compute transitions.)")
+
         ax = axes[idx]
         ax.scatter(df['tSNE_X'], df['tSNE_Y'], c='lightgray', s=50, alpha=0.3, label='Group Map')
-        ax.scatter(t1_df['tSNE_X'], t1_df['tSNE_Y'], c='red', s=150, alpha=0.8, label='Time 1')
-        ax.scatter(t2_df['tSNE_X'], t2_df['tSNE_Y'], c='green', s=150, alpha=0.8, label='Time 2')
 
-        if len(t1_df) > 0 and len(t2_df) > 0:
-            ax.plot([t1_df['tSNE_X'].mean(), t2_df['tSNE_X'].mean()],
-                    [t1_df['tSNE_Y'].mean(), t2_df['tSNE_Y'].mean()],
-                    color='black', linestyle='--', linewidth=2, label='Trajectory')
+        centroid_xy = []
+        for phase in phases:
+            sub = p_df[p_df['Time_Phase'] == phase]
+            if len(sub) == 0:
+                continue
+            ax.scatter(sub['tSNE_X'], sub['tSNE_Y'],
+                       c=[phase_colors[phase]], s=150, alpha=0.85, label=phase)
+            centroid_xy.append((sub['tSNE_X'].mean(), sub['tSNE_Y'].mean()))
+
+        if len(centroid_xy) >= 2:
+            xs, ys = zip(*centroid_xy)
+            ax.plot(xs, ys, color='black', linestyle='--', linewidth=2, label='Trajectory')
 
         ax.set_title(f"Participant: {p_id}", fontweight='bold')
         ax.set_aspect('equal', adjustable='datalim')
         ax.margins(0.1)
         ax.legend(loc='best', fontsize='small')
+
     for i in range(len(participants), len(axes)):
         fig.delaxes(axes[i])
 
-    plt.suptitle("Individual Semantic Trajectories on Global Map", fontsize=18, y=1.02)
+    plt.suptitle(f"Individual Semantic Trajectories on Global Map ({len(phases)} windows)",
+                 fontsize=18, y=1.02)
     plt.tight_layout()
     plt.show()
 
@@ -278,7 +380,92 @@ def score_idea_originality(idea, csv_filepath):
     return target_distance
 
 # ==========================================
-# 7. EXECUTION BLOCK
+# 7. CROSS-SESSION COMPARISON
+# ==========================================
+def run_cross_session_comparison(csv_filepaths, session_names=None):
+    """
+    Embeds ideas from multiple sessions onto a single shared t-SNE map and
+    reports pairwise centroid shift, dispersion, and novelty. Session centroids
+    are connected in input order so you can see how repeated sessions drift.
+    """
+    if len(csv_filepaths) < 2:
+        raise ValueError("Need at least 2 CSV files to compare sessions.")
+
+    if session_names is None:
+        session_names = [f"Session {i + 1}" for i in range(len(csv_filepaths))]
+    if len(session_names) != len(csv_filepaths):
+        raise ValueError("session_names length must match csv_filepaths length.")
+
+    print(f"\n=== RUNNING CROSS-SESSION COMPARISON: {len(csv_filepaths)} sessions ===")
+
+    session_data = []
+    for path, name in zip(csv_filepaths, session_names):
+        df = pd.read_csv(path).dropna(subset=['idea'])
+        ideas = df['idea'].tolist()
+        if len(ideas) == 0:
+            print(f"{name}: 0 ideas (skipped)")
+            continue
+        print(f"Encoding {len(ideas)} ideas from {name}...")
+        emb = model.encode(ideas)
+        session_data.append({'name': name, 'ideas': ideas, 'emb': emb})
+
+    if len(session_data) < 2:
+        print("\nERROR: Need at least 2 non-empty sessions.")
+        return
+
+    print("\n--- CROSS-SESSION REPORT ---")
+    print("Per-session:")
+    for s in session_data:
+        disp = get_dispersion(s['emb']) if len(s['emb']) >= 2 else float('nan')
+        disp_str = f"{disp:.4f}" if not math.isnan(disp) else "n/a"
+        print(f"  {s['name']}: {len(s['ideas'])} ideas | Dispersion: {disp_str}")
+
+    print("\nPairwise comparisons:")
+    for i in range(len(session_data)):
+        for j in range(i + 1, len(session_data)):
+            a, b = session_data[i], session_data[j]
+            shift = get_centroid_shift(a['emb'], b['emb'])
+            novelty = get_novelty(b['emb'], a['emb'])
+            print(f"  {a['name']} <-> {b['name']}: Shift={shift:.4f} | "
+                  f"Novelty({b['name']} vs {a['name']})={novelty:.4f}")
+
+    # --- Shared t-SNE projection ---
+    all_ideas = [idea for s in session_data for idea in s['ideas']]
+    all_emb = np.vstack([s['emb'] for s in session_data])
+
+    perp = min(max(5, len(all_ideas) // 4), len(all_ideas) - 1)
+    tsne_2d = TSNE(n_components=2, perplexity=perp, random_state=42).fit_transform(all_emb)
+
+    cmap = plt.get_cmap('tab10', max(len(session_data), 10))
+    session_colors = [cmap(i) for i in range(len(session_data))]
+
+    plt.figure(figsize=(12, 9))
+
+    offsets = np.cumsum([0] + [len(s['ideas']) for s in session_data])
+    centroid_xy = []
+    for i, s in enumerate(session_data):
+        start, end = offsets[i], offsets[i + 1]
+        plt.scatter(tsne_2d[start:end, 0], tsne_2d[start:end, 1],
+                    s=150, color=session_colors[i], alpha=0.7, label=s['name'])
+        for k in range(start, end):
+            short_label = " ".join(s['ideas'][k - start].split()[:3]) + "..."
+            plt.annotate(short_label, (tsne_2d[k, 0], tsne_2d[k, 1]),
+                         xytext=(5, 5), textcoords='offset points', fontsize=7)
+        centroid_xy.append((tsne_2d[start:end, 0].mean(), tsne_2d[start:end, 1].mean()))
+
+    xs, ys = zip(*centroid_xy)
+    plt.plot(xs, ys, color='black', linestyle='--', linewidth=2, alpha=0.6, label='Session trajectory')
+    plt.scatter(xs, ys, s=300, c=session_colors, marker='X', edgecolor='black', linewidth=1.5, zorder=5)
+
+    plt.title("Cross-Session Semantic Comparison", fontweight='bold')
+    plt.gca().set_aspect('equal', adjustable='datalim')
+    plt.margins(0.2)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend(loc='best')
+    plt.show()
+
+# ==========================================
+# 8. EXECUTION BLOCK
 # ==========================================
 if __name__ == "__main__":
     # How to use this file:
@@ -286,9 +473,17 @@ if __name__ == "__main__":
 
     csv_file = 'ideaData.csv'
 
-    # Uncomment the pipeline you want to run:
+    # Uncomment the pipeline you want to run. Window controls:
+    #   n_windows=N           -> N equal-duration windows (default 2)
+    #   window_minutes=M      -> fixed M-minute windows (overrides n_windows)
+
     run_full_tsne_visual(csv_file)
-    # run_group_telemetry(csv_file)
-    # run_individual_telemetry(csv_file)
+    # run_full_tsne_visual(csv_file, color_by_time=False)
+    # run_group_telemetry(csv_file, n_windows=4)
+    # run_group_telemetry(csv_file, window_minutes=2)
+    # run_individual_telemetry(csv_file, n_windows=3)
     # score_idea_originality("Making certain bundles be all inclusive,", csv_file)
-    pass
+    # run_cross_session_comparison(
+    #     ['sessionA.csv', 'sessionB.csv'],
+    #     session_names=['Monday brainstorm', 'Friday brainstorm'],
+    # )

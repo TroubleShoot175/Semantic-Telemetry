@@ -6,52 +6,47 @@ from sentence_transformers import SentenceTransformer
 from sklearn.manifold import TSNE
 from sklearn.metrics.pairwise import cosine_similarity
 from matplotlib.lines import Line2D
+
 # ==========================================
 # 1. START THE ENGINE (Load once to save memory)
 # ==========================================
 print("Loading linguistic engine (SBERT)...")
 model = SentenceTransformer('all-MiniLM-L6-v2')
+
 # ==========================================
 # 2. CORE TELEMETRY MATH (Helper Functions)
 # ==========================================
 def get_centroid_distance(idea_embedding, reference_embeddings):
-    """
-    Calculates the semantic distance of a single idea's embedding
-    from the centroid of a set of reference embeddings.
-    A higher score = more distant from the group average = more original.
-    """
     if len(reference_embeddings) == 0:
         return 0.0
     centroid = np.mean(reference_embeddings, axis=0).reshape(1, -1)
     return 1.0 - cosine_similarity(idea_embedding.reshape(1, -1), centroid)[0][0]
 
 def get_centroid_shift(emb_t1, emb_t2):
-    """Calculates the semantic drift between two sets of embeddings."""
     if len(emb_t1) == 0 or len(emb_t2) == 0: return 0.0
     c1 = np.mean(emb_t1, axis=0).reshape(1, -1)
     c2 = np.mean(emb_t2, axis=0).reshape(1, -1)
     return 1.0 - cosine_similarity(c1, c2)[0][0]
 
 def get_dispersion(embeddings):
-    """Calculates the internal spread (divergence) of a set of embeddings."""
     if len(embeddings) < 2: return 0.0
     sim_matrix = cosine_similarity(embeddings)
     upper_triangle = np.triu_indices_from(sim_matrix, k=1)
     return 1.0 - np.mean(sim_matrix[upper_triangle])
 
 def get_novelty(emb_t2, emb_t1):
-    """Calculates the minimum distance to past ideas (True Novelty)."""
     if len(emb_t1) == 0 or len(emb_t2) == 0: return 0.0
     cross_sim = cosine_similarity(emb_t2, emb_t1)
     min_dist_to_past = 1.0 - np.max(cross_sim, axis=1)
     return np.mean(min_dist_to_past)
 
 def ingest_and_split(csv_filepath, requires_participants=False):
-    """Standardized data intake manifold."""
+    """Standardized data intake manifold. 
+    Uses 'phase' column if available; otherwise falls back to timestamp splitting."""
     df = pd.read_csv(csv_filepath)
 
     # Check for required columns
-    required_cols = ['timeStamp', 'idea']
+    required_cols = ['idea']
     if requires_participants:
         required_cols.append('participant_id')
 
@@ -60,12 +55,34 @@ def ingest_and_split(csv_filepath, requires_participants=False):
             raise ValueError(f"CSV is missing required column: '{col}'")
 
     df = df.dropna(subset=required_cols)
-    df['timeStamp'] = pd.to_datetime(df['timeStamp'])
-    df = df.sort_values(by='timeStamp')
 
-    start_time = df['timeStamp'].min()
-    midpoint = start_time + pd.Timedelta(minutes=5)
-    df['Time_Phase'] = np.where(df['timeStamp'] < midpoint, 'Time 1', 'Time 2')
+    # --- PRIMARY METHOD: Use 'phase' column ---
+    if 'phase' in df.columns:
+        print("Found 'phase' column. Using it to separate ideas into two sets.")
+        unique_phases = sorted(df['phase'].dropna().unique())
+
+        if len(unique_phases) < 2:
+            raise ValueError("The 'phase' column must contain at least 2 unique values to split.")
+
+        # Map the first two unique phase values to Time 1 and Time 2
+        phase_map = {unique_phases[0]: 'Time 1', unique_phases[1]: 'Time 2'}
+        print(f"  Phase '{unique_phases[0]}' → Time 1")
+        print(f"  Phase '{unique_phases[1]}' → Time 2")
+
+        df['Time_Phase'] = df['phase'].map(phase_map)
+        df = df.dropna(subset=['Time_Phase'])
+
+    # --- FALLBACK METHOD: Use timestamp ---
+    elif 'timeStamp' in df.columns:
+        print("No 'phase' column found. Falling back to timestamp-based splitting.")
+        df['timeStamp'] = pd.to_datetime(df['timeStamp'])
+        df = df.sort_values(by='timeStamp')
+        start_time = df['timeStamp'].min()
+        midpoint = start_time + pd.Timedelta(minutes=5)
+        df['Time_Phase'] = np.where(df['timeStamp'] < midpoint, 'Time 1', 'Time 2')
+
+    else:
+        raise ValueError("CSV must contain either a 'phase' column or a 'timeStamp' column.")
 
     return df
 
@@ -97,13 +114,7 @@ def run_full_tsne_visual(csv_filepath):
 
     for i, idea in enumerate(all_ideas):
         short_label = " ".join(idea.split()[:3]) + "..."
-        plt.annotate(
-            short_label,
-            (tsne_2d[i, 0], tsne_2d[i, 1]),
-            xytext=(5, 5),
-            textcoords='offset points',
-            fontsize=8
-        )
+        plt.annotate(short_label, (tsne_2d[i, 0], tsne_2d[i, 1]), xytext=(5, 5), textcoords='offset points', fontsize=8)
 
     plt.title("Full Semantic Map: All Ideas", fontweight='bold')
     plt.gca().set_aspect('equal', adjustable='datalim')
@@ -123,17 +134,17 @@ def run_group_telemetry(csv_filepath):
 
     ideas_t1, ideas_t2 = t1_df['idea'].tolist(), t2_df['idea'].tolist()
 
-    print(f"Time 1 Ideas (0-5 mins): {len(ideas_t1)}")
-    print(f"Time 2 Ideas (5-10 mins): {len(ideas_t2)}")
+    print(f"Time 1 Ideas: {len(ideas_t1)}")
+    print(f"Time 2 Ideas: {len(ideas_t2)}")
 
     if len(ideas_t1) < 2 or len(ideas_t2) < 2:
         print("\nERROR: Not enough ideas to run math.")
         return
+
     print("Encoding ideas into semantic space...")
     emb_t1 = model.encode(ideas_t1)
     emb_t2 = model.encode(ideas_t2)
 
-    # --- Metrics ---
     shift = get_centroid_shift(emb_t1, emb_t2)
     disp1, disp2 = get_dispersion(emb_t1), get_dispersion(emb_t2)
     novelty = get_novelty(emb_t2, emb_t1)
@@ -144,7 +155,7 @@ def run_group_telemetry(csv_filepath):
     print(f"   Dispersion Time 2: {disp2:.4f}")
     print(f"   Net Expansion: {disp2 - disp1:+.4f}")
     print(f"3. Avg Novelty of Time 2 Ideas: {novelty:.4f}")
-    # --- Plotting ---
+
     all_ideas = ideas_t1 + ideas_t2
     all_embeddings = np.vstack((emb_t1, emb_t2))
     colors = ['red'] * len(ideas_t1) + ['green'] * len(ideas_t2)
@@ -191,7 +202,7 @@ def run_individual_telemetry(csv_filepath):
     cols = 2
     rows = math.ceil(len(participants) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(15, 6 * rows))
-    if len(participants) == 1: axes = [axes] # Handle single participant edge case
+    if len(participants) == 1: axes = [axes]
     else: axes = axes.flatten()
 
     for idx, p_id in enumerate(participants):
@@ -205,12 +216,12 @@ def run_individual_telemetry(csv_filepath):
         if len(t1_df) > 0 and len(t2_df) > 0:
             emb_t1 = np.vstack(t1_df['embedding'].values)
             emb_t2 = np.vstack(t2_df['embedding'].values)
-
             print(f"Centroid Shift: {get_centroid_shift(emb_t1, emb_t2):.4f}")
             if len(emb_t1) > 1 and len(emb_t2) > 1:
                 print(f"Dispersion Change: {get_dispersion(emb_t2) - get_dispersion(emb_t1):+.4f}")
         else:
             print("Metrics: Needs ideas in BOTH time periods to calculate shift.")
+
         ax = axes[idx]
         ax.scatter(df['tSNE_X'], df['tSNE_Y'], c='lightgray', s=50, alpha=0.3, label='Group Map')
         ax.scatter(t1_df['tSNE_X'], t1_df['tSNE_Y'], c='red', s=150, alpha=0.8, label='Time 1')
@@ -225,6 +236,7 @@ def run_individual_telemetry(csv_filepath):
         ax.set_aspect('equal', adjustable='datalim')
         ax.margins(0.1)
         ax.legend(loc='best', fontsize='small')
+
     for i in range(len(participants), len(axes)):
         fig.delaxes(axes[i])
 
@@ -236,11 +248,6 @@ def run_individual_telemetry(csv_filepath):
 # 6. SINGLE IDEA ORIGINALITY
 # ==========================================
 def score_idea_originality(idea, csv_filepath):
-    """
-    Scores a single idea's originality against the centroid of all ideas
-    in a reference CSV. Prints distance and contextualizes it against
-    the distribution of all ideas in the dataset.
-    """
     print(f"\n=== CENTROID ORIGINALITY SCORE ===")
     print(f"Idea: '{idea}'")
 
@@ -253,11 +260,7 @@ def score_idea_originality(idea, csv_filepath):
 
     target_distance = get_centroid_distance(idea_embedding, ref_embeddings)
 
-    # Score every reference idea against the same centroid for context
-    all_distances = [
-        get_centroid_distance(emb, ref_embeddings)
-        for emb in ref_embeddings
-    ]
+    all_distances = [get_centroid_distance(emb, ref_embeddings) for emb in ref_embeddings]
 
     percentile = np.mean(np.array(all_distances) < target_distance) * 100
 
@@ -273,7 +276,8 @@ def score_idea_originality(idea, csv_filepath):
 # ==========================================
 if __name__ == "__main__":
     # How to use this file:
-    # Make sure your CSV has the columns: 'timeStamp', 'idea', and (optionally) 'participant_id'
+    # Your CSV needs: 'idea' column (required), 'phase' column (preferred), 
+    # or 'timeStamp' column (fallback), and optionally 'participant_id'
 
     csv_file = 'ideaData.csv'
 
